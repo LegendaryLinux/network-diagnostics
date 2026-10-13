@@ -3,10 +3,10 @@ import os
 import socket
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from netdiag.protocol import FRAME_SIZE, load_key, make_request, make_response, parse_frame, verify_response
-from netdiag.remote import EchoService
+from netdiag.remote import EchoService, serve
 
 
 KEY = b"local-test-only-secret-32-bytes-long"
@@ -58,6 +58,71 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(service.response(make_request(KEY)))
 
 
+class RemoteShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.loop = asyncio.get_running_loop()
+        self.server = asyncio.base_events.Server(self.loop, [], None, None, 64, None)
+        self.service = EchoService(KEY)
+        self.writer = MagicMock()
+        self.writer.wait_closed = AsyncMock()
+        # Server tracks transports on newer Python and a count on older releases.
+        if hasattr(self.server, "_clients"):
+            self.server._attach(self.writer)
+            self.writer.close.side_effect = lambda: self.server._detach(self.writer)
+        else:
+            self.server._attach()
+            self.writer.close.side_effect = self.server._detach
+        self.service.accept(asyncio.StreamReader(), self.writer)
+        await asyncio.sleep(0)
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.service.close()
+        await self.server.wait_closed()
+
+    async def test_cancel_closes_persistent_clients_and_udp_before_waiting(self):
+        started = asyncio.Event()
+        udp = MagicMock()
+
+        async def endpoint(*args, **kwargs):
+            self.service.connection_made(udp)
+            started.set()
+            return udp, self.service
+
+        with patch("netdiag.remote.EchoService", return_value=self.service), \
+                patch("asyncio.start_server", AsyncMock(return_value=self.server)), \
+                patch.object(self.loop, "create_datagram_endpoint", side_effect=endpoint), \
+                patch.object(self.server, "serve_forever", side_effect=asyncio.Event().wait), \
+                patch("builtins.print"):
+            # Do not let newer serve_forever implementations close clients for us.
+            task = asyncio.create_task(serve(key=KEY))
+            await started.wait()
+            task.cancel()
+            try:
+                done, _ = await asyncio.wait([task], timeout=1)
+                self.assertIn(task, done, "shutdown waited for clients before closing them")
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.writer.close.assert_called_once()
+                udp.close.assert_called_once()
+                self.assertFalse(self.service.clients)
+            finally:
+                if not task.done():
+                    await self.service.close()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_udp_setup_failure_closes_tcp_clients(self):
+        with patch("netdiag.remote.EchoService", return_value=self.service), \
+                patch("asyncio.start_server", AsyncMock(return_value=self.server)), \
+                patch.object(self.loop, "create_datagram_endpoint",
+                             AsyncMock(side_effect=OSError("UDP bind failed"))):
+            with self.assertRaisesRegex(OSError, "UDP bind failed"):
+                await asyncio.wait_for(serve(key=KEY), 1)
+        self.writer.close.assert_called_once()
+        self.assertFalse(self.service.clients)
+        self.assertEqual(self.server.sockets, ())
+
+
 class RemoteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         try:
@@ -75,8 +140,8 @@ class RemoteTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.server.close()
-        await self.server.wait_closed()
         await self.service.close()
+        await self.server.wait_closed()
 
     async def test_tcp_persistence_and_invalid_frame_closes(self):
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)

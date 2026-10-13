@@ -92,12 +92,12 @@ async def serve(host="0.0.0.0", port=48123, *, key=None):
         await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: service, local_addr=(host, port))
         print(f"Diagnostic companion listening on {host}:{port} TCP and UDP", flush=True)
-        async with server:
-            await server.serve_forever()
+        # start_server already accepts; close clients before waiting for server shutdown.
+        await asyncio.Future()
     finally:
         server.close()
-        await server.wait_closed()
         await service.close()
+        await server.wait_closed()
 
 
 def main():

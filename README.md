@@ -41,26 +41,44 @@ This is a fragment to insert in the existing JSON configuration, not a complete 
 
 The sampling rate applies to individual probe streams, so the combined number of requests is greater than five per second. Public services are checked at the slower interval to limit load. Public checks are small synthetic reachability requests; they do not download streams or log into accounts. Configure an explicit gateway if your default route points through a VPN or unusual routing setup. The initial implementation uses IPv4 for ICMP, explicit DNS, and UDP companion tests.
 
-## Run the companion on Ubuntu Server
+## Run the companion as an Ubuntu service
 
-Copy this repository to the server using your existing secure transfer process. Install Python 3.10 or newer if needed (`python3` through Ubuntu's normal package-management process). No third-party Python dependencies are needed. Run it under an ordinary user account, from the repository directory.
+Use Ubuntu Server 22.04 or newer with systemd and Python 3.10 or newer. Copy this repository to the server using your existing secure transfer process. If Python is missing, install it with `sudo apt install python3`. No third-party Python dependencies are needed.
 
-Create a random shared secret containing at least 32 bytes using a password manager, and keep the same secret on both computers. Enter it through a hidden Bash prompt on **each** machine:
+The included system-wide service runs as a temporary, unprivileged systemd user. It starts at boot, restarts after failures, and keeps running when you disconnect SSH. The service only needs the companion modules; it does not install the collector or dashboard on the server. From the repository directory on Ubuntu, install the code and unit:
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/network-diagnostics /opt/network-diagnostics/netdiag
+sudo install -o root -g root -m 0644 netdiag/__init__.py netdiag/protocol.py netdiag/remote.py /opt/network-diagnostics/netdiag/
+sudo install -o root -g root -m 0644 deploy/network-diagnostics-remote.service /etc/systemd/system/network-diagnostics-remote.service
+sudo install -d -o root -g root -m 0700 /etc/network-diagnostics
+sudo touch /etc/network-diagnostics/remote.env
+sudo chown root:root /etc/network-diagnostics/remote.env
+sudo chmod 0600 /etc/network-diagnostics/remote.env
+sudoedit /etc/network-diagnostics/remote.env
+```
+
+These commands preserve an existing secret file's contents when rerun. In the editor, set one line, `NETDIAG_KEY=YOUR_SECRET`, replacing `YOUR_SECRET` with a password-manager-generated random secret of at least 32 bytes (for example, 64 random hexadecimal characters). Save the same value in your password manager for the client; keep an existing key when updating an installation. Do not use the placeholder literally. The secret file stays outside the repository and is readable only by root; systemd passes its value to the unprivileged process environment. Do not put the key in the unit, `config.json`, shell commands/history, source files, or the dataset.
+
+If a manually launched companion is still running, stop it with **Ctrl+C** first so it releases the port. Start the service and enable it at boot:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now network-diagnostics-remote.service
+sudo systemctl status network-diagnostics-remote.service --no-pager
+sudo journalctl -u network-diagnostics-remote.service -n 50 --no-pager
+```
+
+Confirm the status is `active (running)` and the journal reports listening on `0.0.0.0:48123 TCP and UDP` before disconnecting SSH. No server-side shell environment or open SSH session is needed after installation. The service has a read-only system filesystem, private temporary storage, no access to home directories, and no Linux capabilities. It writes operational output to the journal and stores no measurement dataset on the server.
+
+On the **Arch client**, enter the matching key through a hidden Bash prompt before starting the collector:
 
 ```bash
 read -rsp 'Diagnostic shared key: ' NETDIAG_KEY
 export NETDIAG_KEY
 ```
 
-The prompt does not echo the secret. Do not put the key in `config.json`, command arguments, shell history, source files, or the dataset. It is inherited through the process environment. After stopping the process, `unset NETDIAG_KEY` clears that shell's copy. For a user-managed service, use your established secret provisioning rather than embedding the secret in a unit file.
-
-On the server:
-
-```bash
-python3 -m netdiag.remote --bind 0.0.0.0 --port 48123
-```
-
-On the Arch client, set `remote` in the configuration as described above and run the collector with the shared key in its environment. Ensure the clocks on both computers are synchronized; authenticated requests outside a 30-second clock window are rejected.
+The prompt does not echo the secret. Set `remote` in the configuration as described above and run `python -m netdiag collect --config config.json` from the repository. After stopping the collector, `unset NETDIAG_KEY` clears that shell's copy. Ensure the clocks on both computers are synchronized; authenticated requests outside a 30-second clock window are rejected.
 
 Allow inbound **TCP and UDP port 48123** in your server and provider firewall, preferably restricted to your client address where practical. Configure any necessary server-side NAT forwarding. This project does not modify firewall rules or deploy to your server. The same numeric port serves both protocols, but TCP and UDP require separate firewall permissions. The port is configurable; choosing a high port avoids needing root and does not guarantee a less-congested network path. ICMP ping has no port and must be allowed separately if desired. HTTPS/TLS timing comes from the public-service checks on their normal ports; the synthetic companion protocol is not HTTP or TLS.
 
@@ -68,7 +86,31 @@ The companion sends fixed 97-byte authenticated synthetic responses to fixed 97-
 
 Invalid messages consume the global rate budget, and unauthenticated TCP clients can occupy connection slots until their deadline. Hostile traffic to an exposed port can therefore cause diagnostic failures despite a healthy home connection. Restricting inbound traffic to your client address helps reduce this interference. Compare server availability and load with the recorded failures before drawing conclusions about the ISP.
 
-Stop the server with **Ctrl+C**. After a server restart, the client should reconnect and retain failures recorded while the server was unavailable. The in-memory replay cache resets at restart; the short freshness window and equal-size replies limit the impact of a captured request during that window.
+Manage the companion on Ubuntu with these commands:
+
+```bash
+sudo systemctl status network-diagnostics-remote.service --no-pager
+sudo journalctl -u network-diagnostics-remote.service -f
+sudo systemctl restart network-diagnostics-remote.service
+sudo systemctl stop network-diagnostics-remote.service
+sudo systemctl start network-diagnostics-remote.service
+```
+
+Use each command as needed; **Ctrl+C** exits the live journal view without stopping the service. An explicit `stop` leaves it stopped until you start it or reboot. To stop it and also prevent startup at boot, use `sudo systemctl disable --now network-diagnostics-remote.service`. To change the shared key, use `sudoedit /etc/network-diagnostics/remote.env`, then restart the service and update the client's key. For code/unit updates, repeat the installation commands without replacing the secret, run `sudo systemctl daemon-reload`, and restart the service. If startup fails, inspect the journal for a missing/invalid key, port conflict, or installation path error.
+
+The service requests graceful shutdown with SIGINT and allows 15 seconds before forced termination. After a server restart, the client should reconnect and retain failures recorded while the server was unavailable. The in-memory replay cache resets at restart; the short freshness window and equal-size replies limit the impact of a captured request during that window.
+
+To uninstall the service and its installed code (the repository and client dataset are unaffected):
+
+```bash
+sudo systemctl disable --now network-diagnostics-remote.service
+sudo rm /etc/systemd/system/network-diagnostics-remote.service
+sudo systemctl daemon-reload
+sudo rm /opt/network-diagnostics/netdiag/__init__.py /opt/network-diagnostics/netdiag/protocol.py /opt/network-diagnostics/netdiag/remote.py
+sudo rmdir /opt/network-diagnostics/netdiag /opt/network-diagnostics
+```
+
+This leaves the protected key available for reinstallation. If you also want to delete it, run `sudo rm /etc/network-diagnostics/remote.env` followed by `sudo rmdir /etc/network-diagnostics`.
 
 ## Inspect results
 
@@ -115,7 +157,7 @@ The tests use local synthetic fixtures rather than sustained traffic against pub
 
 The development environment used for this implementation blocks network socket creation, and an actual browser session and Ubuntu deployment have not been verified there. After configuring your server and shared key, perform these practical checks on your machines:
 
-1. On Ubuntu, run `python3 -m netdiag.remote --bind 0.0.0.0 --port 48123`. On Arch, run `python -m netdiag collect --config config.json` with the matching `remote` configuration and key. Confirm both processes remain running and the dashboard shows results for the remote probe streams.
+1. Install and enable the Ubuntu service as described above. Confirm `sudo systemctl is-enabled network-diagnostics-remote.service` reports `enabled` and `sudo systemctl is-active network-diagnostics-remote.service` reports `active`. On Arch, run `python -m netdiag collect --config config.json` with the matching `remote` configuration and key. Confirm the dashboard shows successful remote exchanges, then disconnect SSH and confirm those exchanges continue. At a suitable time, reboot Ubuntu and confirm the service starts automatically and exchanges resume; the reboot interval should remain recorded as failures.
 2. Open `http://127.0.0.1:8765/` in your browser. Confirm results update after five seconds. Choose **Last 15 minutes**, change **Target**, **Probe**, and **Graph metric**, then click a graph timeframe or select **Inspect timeframe**. Select a result timestamp to inspect its full record, and use **Older results** and **Newer results** when enough records exist. Try a **Custom interval**, **Apply interval**, **Clear timeframe**, **Follow latest**, and **Refresh now**.
-3. Stop the companion with Ctrl+C while leaving collection running. Confirm failed remote exchanges appear. Restart the companion with the same command and key; confirm successful persistent TCP reconnection and resumed UDP replies. ICMP may remain successful during this test because the server host itself is still reachable.
+3. Run `sudo systemctl stop network-diagnostics-remote.service` on Ubuntu while leaving collection running. Confirm failed remote exchanges appear. Run `sudo systemctl start network-diagnostics-remote.service` and confirm successful persistent TCP reconnection and resumed UDP replies. ICMP may remain successful during this test because the server host itself is still reachable. To check restart-on-failure during this test session, run `sudo systemctl kill --signal=SIGKILL --kill-who=main network-diagnostics-remote.service`; confirm it returns to `active` after about five seconds, and inspect the journal for the restart. This deliberately interrupts the companion, so mark that interval as a server test when interpreting the dataset.
 4. Stop the collector with Ctrl+C, restart it against the same dataset, and confirm older records remain alongside the new session. Stop it again and use the standalone dashboard command above to inspect the retained history. A stopped or interrupted collection session must not be interpreted as network recovery.
