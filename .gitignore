@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+data/
+config.json
+.env
+.env.*
+*.sqlite*
+*.db
+*.db-*
+.idea/
+.agents/
+.aws/
+.codex/
+.project-manager/
