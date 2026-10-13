@@ -1,4 +1,4 @@
-"""Validated configuration; authentication is exclusively environment supplied."""
+"""Validated probe configuration; authentication passphrases are supplied separately."""
 import ipaddress
 import json
 import math

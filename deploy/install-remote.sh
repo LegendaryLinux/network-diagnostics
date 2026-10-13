@@ -15,11 +15,10 @@ fi
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 if [[ ! -s /etc/network-diagnostics/remote.env ]]; then
-    IFS= read -r -s -p 'Shared key (at least 32 bytes; use the same key on your client): ' diagnostic_key
+    IFS= read -r -s -p 'Shared passphrase (use the same passphrase on your client): ' diagnostic_key
     printf '\n' >&2
-    LC_ALL=C
-    if (( ${#diagnostic_key} < 32 )); then
-        printf 'Key is too short; nothing was installed.\n' >&2
+    if [[ -z "$diagnostic_key" ]]; then
+        printf 'Passphrase must not be empty; nothing was installed.\n' >&2
         exit 1
     fi
     diagnostic_key=${diagnostic_key//\\/\\\\}

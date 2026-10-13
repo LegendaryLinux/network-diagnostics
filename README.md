@@ -53,7 +53,7 @@ Use Ubuntu Server 22.04 or newer with systemd and Python 3.10+. Copy this reposi
 sudo bash deploy/install-remote.sh
 ```
 
-On first installation, enter a random shared key of at least 32 bytes at the hidden prompt (for example, 64 random hexadecimal characters from a password manager). Save that same key for your client. The installer keeps it in `/etc/network-diagnostics/remote.env`, readable only by root. Rerunning the command updates and restarts the service without prompting for or replacing an existing key.
+On first installation, enter a nonempty shared passphrase at the hidden prompt. Use exactly the same passphrase on your client, including spaces and capitalization. The installer keeps it in `/etc/network-diagnostics/remote.env`, readable only by root. Rerunning the command updates and restarts the service without prompting for or replacing an existing key.
 
 The companion starts at boot, restarts after failures, and runs as an unprivileged user. Once the installer reports success, you can disconnect SSH. If you previously started the companion manually, stop that process with **Ctrl+C** before installing so it releases the port. No third-party Python packages are needed; if Python is missing, install it with `sudo apt install python3` first.
 
@@ -63,7 +63,9 @@ On the **Arch client**, set `remote` in the configuration as described above and
 python -m netdiag collect --config config.json
 ```
 
-Enter the matching shared key at the hidden prompt. It must contain at least 32 UTF-8 bytes. The client keeps the entered key in memory for that run; it does not save it to your configuration or dataset. Local-only collection and dashboard inspection do not prompt. For unattended collection, supply `NETDIAG_KEY` through your environment instead; a nonempty environment key takes precedence. Without a usable terminal or an environment key, remote collection exits before creating a dataset. Ensure the clocks on both computers are synchronized; authenticated requests outside a 30-second clock window are rejected.
+Enter the matching passphrase at the hidden prompt; there is no minimum length beyond being nonempty. Both programs derive their authentication key from that passphrase once at startup. The client keeps it in memory for that run; it does not save it to your configuration or dataset. Local-only collection and dashboard inspection do not prompt. For unattended collection, supply `NETDIAG_KEY` through your environment instead; a nonempty environment passphrase takes precedence. Without a usable terminal or an environment passphrase, remote collection exits before creating a dataset. Ensure the clocks on both computers are synchronized; authenticated requests outside a 30-second clock window are rejected.
+
+**Updating an existing installation:** update the code on both the client and server, and rerun the server installer. Existing `/etc/network-diagnostics/remote.env` values are preserved and now used as passphrases. Older raw-key clients or companions cannot authenticate with the new derived-key version, even when the entered text is identical.
 
 Allow inbound **TCP and UDP port 48123** in your server/provider firewall, preferably restricted to your client address. ICMP ping must be allowed separately; it has no port. The installer does not change firewall rules. Public-service HTTPS tests use their normal ports; the companion protocol is not HTTP or TLS.
 
@@ -79,6 +81,8 @@ Use each command as needed. **Ctrl+C** exits the log view without stopping the s
 
 <details>
 <summary>Protocol details and removal</summary>
+
+Authentication keys are derived using PBKDF2-HMAC-SHA256 with 600,000 iterations, a 32-byte output, and the fixed versioned application salt `network-diagnostics/auth-key/v1`. The exact UTF-8 passphrase is used without trimming or normalization. Derivation produces the required key size; it does not add password entropy. This fixed domain salt is not a unique random salt per installation: captured authenticated traffic permits offline password guessing, and guesses can be reused across installations. Predictable passwords remain guessable; choose a passphrase that is difficult to guess.
 
 The companion sends fixed 97-byte authenticated synthetic responses to fixed 97-byte requests. Responses are bound to the request nonce, sequence, timestamp, and synthetic payload. Invalid, expired, and replayed messages receive no reply. It accepts at most 64 concurrent TCP clients and 200 candidate messages/second globally, with a 10-second idle/write deadline and a bounded replay cache. Rate limits are safety bounds, not target throughput: exceeding them can itself cause probe failures. TCP connect-only checks require no shared secret at the connection handshake; only authenticated application frames receive data. The protocol authenticates synthetic traffic but does not encrypt it; it carries no captured application traffic or user content.
 

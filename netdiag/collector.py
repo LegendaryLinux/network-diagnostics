@@ -36,7 +36,7 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
             from .protocol import load_key
             key = load_key()
         if not isinstance(key,bytes) or len(key)<32:
-            raise ValueError('The shared key must contain at least 32 UTF-8 bytes')
+            raise ValueError('The derived authentication key must contain at least 32 bytes')
     store = Store(config['db'],config)
     stop = stop or asyncio.Event()
     server = None

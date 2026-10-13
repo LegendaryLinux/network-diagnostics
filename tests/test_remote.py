@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from netdiag.protocol import FRAME_SIZE, load_key, make_request, make_response, parse_frame, verify_response
+from netdiag.protocol import FRAME_SIZE, derive_key, load_key, make_request, make_response, parse_frame, verify_response
 from netdiag.remote import EchoService, serve
 
 
@@ -42,7 +42,32 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_key()
         with patch.dict(os.environ, {"NETDIAG_KEY": KEY.decode()}):
-            self.assertEqual(load_key(), KEY)
+            self.assertEqual(load_key(), derive_key(KEY.decode()))
+
+    def test_passphrase_derivation_and_authentication(self):
+        with patch.dict(os.environ,{'NETDIAG_KEY':'tiny'}):
+            server_key = load_key()
+        client_key = derive_key('tiny')
+        self.assertEqual(len(client_key),32)
+        self.assertEqual(client_key,server_key)
+        request = make_request(client_key)
+        verify_response(make_response(request,server_key),request,client_key)
+        with self.assertRaises(ValueError):
+            parse_frame(request,derive_key('other'),b'Q')
+        with self.assertRaises(ValueError):
+            parse_frame(request,b'tiny',b'Q')
+        self.assertNotEqual(derive_key(' tiny '),client_key)
+        self.assertNotEqual(derive_key('é'),derive_key('e\u0301'))
+        for value in ('',None,'private-\ud800'):
+            with self.assertRaises(ValueError) as error:
+                derive_key(value)
+            self.assertNotIn('private',str(error.exception))
+        with patch('netdiag.protocol.hashlib.pbkdf2_hmac',return_value=b'k'*32) as derive:
+            key = derive_key(' one ')
+            derive.assert_called_once_with('sha256',b' one ',b'network-diagnostics/auth-key/v1',600_000,dklen=32)
+            request = make_request(key)
+            verify_response(make_response(request,key),request,key)
+            self.assertEqual(derive.call_count,1)
 
     def test_replay_and_global_rate_bound(self):
         service = EchoService(KEY, rate=2)

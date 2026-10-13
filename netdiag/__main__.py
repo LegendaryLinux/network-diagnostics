@@ -24,22 +24,18 @@ def main():
             config = load_config(args.config)
             key = None
             if config['remote']:
+                from .protocol import derive_key,load_key
                 if os.environ.get('NETDIAG_KEY'):
-                    from .protocol import load_key
                     key = load_key()
                 else:
                     try:
                         with warnings.catch_warnings():
                             warnings.simplefilter('error',getpass.GetPassWarning)
-                            key = getpass.getpass('Diagnostic shared key: ').encode('utf-8')
+                            key = derive_key(getpass.getpass('Diagnostic shared passphrase: '))
                     except getpass.GetPassWarning:
-                        raise ValueError('Cannot read a hidden key without a usable terminal; supply NETDIAG_KEY for unattended collection') from None
+                        raise ValueError('Cannot read a hidden passphrase without a usable terminal; supply NETDIAG_KEY for unattended collection') from None
                     except (EOFError,KeyboardInterrupt):
-                        raise ValueError('Shared-key entry cancelled; collection was not started') from None
-                    except UnicodeError:
-                        raise ValueError('The shared key must be valid UTF-8 text') from None
-                    if len(key)<32:
-                        raise ValueError('The shared key must contain at least 32 UTF-8 bytes')
+                        raise ValueError('Passphrase entry cancelled; collection was not started') from None
             asyncio.run(run(config,serve_dashboard=not args.no_dashboard,key=key))
         else:
             from .dashboard import create_server

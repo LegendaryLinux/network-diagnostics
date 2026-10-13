@@ -14,12 +14,14 @@ from netdiag.__main__ import main
 from netdiag.collector import collect
 from netdiag.config import load_config
 from netdiag.storage import Reader
+from netdiag.protocol import derive_key
 
 
 class ClientKeyTests(unittest.TestCase):
     def setUp(self):
         self.config = {'remote':{'host':'example.test','port':48123}}
-        self.key = 'synthetic-test-key-not-a-secret-123456'
+        self.key = 'tiny'
+        self.derived_key = derive_key(self.key)
 
     def invoke(self, *, environment=None, prompt=None, config=None, argv=None):
         output = io.StringIO()
@@ -34,8 +36,8 @@ class ClientKeyTests(unittest.TestCase):
             original = copy.deepcopy(self.config)
             result,run,ask,_,after = self.invoke(environment=environment)
             self.assertEqual(result,0)
-            ask.assert_called_once_with('Diagnostic shared key: ')
-            run.assert_awaited_once_with(self.config,serve_dashboard=True,key=self.key.encode())
+            ask.assert_called_once_with('Diagnostic shared passphrase: ')
+            run.assert_awaited_once_with(self.config,serve_dashboard=True,key=self.derived_key)
             self.assertEqual(after,environment)
             self.assertEqual(self.config,original)
 
@@ -43,18 +45,24 @@ class ClientKeyTests(unittest.TestCase):
         result,run,ask,_,after = self.invoke(environment={'NETDIAG_KEY':self.key})
         self.assertEqual(result,0)
         ask.assert_not_called()
-        self.assertEqual(run.call_args.kwargs['key'],self.key.encode())
+        self.assertEqual(run.call_args.kwargs['key'],self.derived_key)
         self.assertEqual(after['NETDIAG_KEY'],self.key)
 
-    def test_short_keys_fail_before_collection_and_utf8_bytes_count(self):
-        for prompt,environment in (({'return_value':'short'},{}),({'return_value':'é'*15},{}),(None,{'NETDIAG_KEY':'short'})):
+    def test_empty_passphrase_fails_and_short_unicode_input_is_accepted(self):
+        result,run,_,output,_ = self.invoke(prompt={'return_value':''})
+        self.assertEqual(result,1)
+        run.assert_not_called()
+        self.assertIn('must not be empty',output)
+        for text in ('x','é',' leading and trailing '):
+            result,run,_,_,_ = self.invoke(prompt={'return_value':text})
+            self.assertEqual(result,0)
+            self.assertEqual(run.call_args.kwargs['key'],derive_key(text))
+        for prompt,environment in (({'return_value':'private-invalid-\ud800'},{}),(None,{'NETDIAG_KEY':'private-invalid-\udcff'})):
             result,run,_,output,_ = self.invoke(prompt=prompt,environment=environment)
             self.assertEqual(result,1)
             run.assert_not_called()
-            self.assertIn('at least 32',output)
-        result,run,_,_,_ = self.invoke(prompt={'return_value':'é'*16})
-        self.assertEqual(result,0)
-        self.assertEqual(len(run.call_args.kwargs['key']),32)
+            self.assertIn('valid UTF-8',output)
+            self.assertNotIn('private-invalid',output)
 
     def test_cancellation_stops_before_collection(self):
         for interruption in (EOFError,KeyboardInterrupt):
@@ -99,13 +107,14 @@ class ClientKeyTests(unittest.TestCase):
             async def stopped_collection():
                 stop = asyncio.Event()
                 stop.set()
-                await collect(config,serve_dashboard=False,stop=stop,key=self.key.encode())
+                await collect(config,serve_dashboard=False,stop=stop,key=self.derived_key)
             output = io.StringIO()
             with patch('netdiag.protocol.load_key') as load_key,contextlib.redirect_stdout(output),contextlib.redirect_stderr(output):
                 asyncio.run(stopped_collection())
             load_key.assert_not_called()
             self.assertNotIn(self.key,output.getvalue())
             self.assertNotIn(self.key.encode(),Path(config['db']).read_bytes())
+            self.assertNotIn(self.derived_key,Path(config['db']).read_bytes())
             self.assertEqual(Reader(config['db']).metadata()['sessions'][0]['config'],config)
 
 

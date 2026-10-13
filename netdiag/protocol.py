@@ -12,11 +12,19 @@ FRAME_SIZE = BODY.size + 32
 MAX_AGE = 30
 
 
+def derive_key(passphrase):
+    """Derive the v1 authentication key once at startup, preserving exact UTF-8 input."""
+    if not isinstance(passphrase,str) or not passphrase:
+        raise ValueError('The shared passphrase must not be empty')
+    try:
+        encoded = passphrase.encode('utf-8')
+    except UnicodeError:
+        raise ValueError('The shared passphrase must be valid UTF-8 text') from None
+    return hashlib.pbkdf2_hmac('sha256',encoded,b'network-diagnostics/auth-key/v1',600_000,dklen=32)
+
+
 def load_key():
-    key = os.environ.get("NETDIAG_KEY", "").encode()
-    if len(key) < 32:
-        raise ValueError("NETDIAG_KEY must contain at least 32 bytes of random secret material")
-    return key
+    return derive_key(os.environ.get('NETDIAG_KEY',''))
 
 
 def make_request(key, sequence=0):
