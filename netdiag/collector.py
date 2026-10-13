@@ -11,6 +11,25 @@ from . import probes
 from .storage import Store
 
 
+class ServiceBackoff:
+    def __init__(self,interval):
+        self.interval = interval
+        self.delay = 0
+        self.until = 0
+        self.status = None
+
+    def observe(self,result,now):
+        if result.get('http_status') in (401,403,429):
+            self.delay = min(max(self.interval,3600),max(60,2*self.interval) if not self.delay else 2*self.delay)
+            wait = max(self.delay,result.get('retry_after_seconds',0))
+            self.until = now+wait
+            self.status = result['http_status']
+            result['detail'] = (result.get('detail','')+'; ' if result.get('detail') else '')+f'service backoff {wait:g}s after HTTP {self.status}'
+        elif result.get('success'):
+            self.delay = self.until = 0
+            self.status = None
+
+
 async def collect(config, *, serve_dashboard=True, stop=None, key=None):
     if config['remote']:
         if key is None:
@@ -30,8 +49,8 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
     for sig in (signal.SIGINT,signal.SIGTERM):
         loop.add_signal_handler(sig,stop.set)
 
-    def add(name,kind,endpoint,interval,function):
-        streams.append({'id':store.target(name,kind,endpoint,interval),'probe':function,'interval':interval,'due':loop.time(),'active':0,'capacity':1 if kind=='persistent_tcp' else min(64,math.ceil(config['timeout']/interval)+2)})
+    def add(name,kind,endpoint,interval,function,service=None):
+        streams.append({'id':store.target(name,kind,endpoint,interval),'probe':function,'interval':interval,'due':loop.time(),'active':0,'service':service,'http':kind in ('http','https'),'capacity':1 if kind in ('persistent_tcp','http','https') else min(64,math.ceil(config['timeout']/interval)+2)})
 
     try:
         if config['gateway']:
@@ -47,10 +66,11 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
         else:
             print('Remote is not configured: persistent TCP and UDP tests are disabled.',file=sys.stderr)
         for service in config['services']:
+            backoff = ServiceBackoff(config['public_interval'])
             parsed = urlsplit(service['url'])
-            add(service['name'],'dns',parsed.hostname,config['public_interval'],functools.partial(probes.dns,parsed.hostname,config['dns_server'],config['timeout']))
-            add(service['name'],'tcp',parsed.hostname+':'+str(parsed.port or (443 if parsed.scheme=='https' else 80)),config['public_interval'],functools.partial(probes.tcp,parsed.hostname,parsed.port or (443 if parsed.scheme=='https' else 80),config['timeout']))
-            add(service['name'],'https' if parsed.scheme=='https' else 'http',service['url'],config['public_interval'],functools.partial(probes.http,service['url'],config['timeout']))
+            add(service['name'],'dns',parsed.hostname,config['public_interval'],functools.partial(probes.dns,parsed.hostname,config['dns_server'],config['timeout']),backoff)
+            add(service['name'],'tcp',parsed.hostname+':'+str(parsed.port or (443 if parsed.scheme=='https' else 80)),config['public_interval'],functools.partial(probes.tcp,parsed.hostname,parsed.port or (443 if parsed.scheme=='https' else 80),config['timeout']),backoff)
+            add(service['name'],'https' if parsed.scheme=='https' else 'http',service['url'],config['public_interval'],functools.partial(probes.http,service['url'],config['timeout']),backoff)
         if not streams:
             raise ValueError('No probe targets configured')
         if serve_dashboard:
@@ -74,7 +94,10 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
                 if task.done():
                     tasks.pop(task)
                     stream['active'] -= 1
-                    pending.append({'target_id':stream['id'],**task.result()})
+                    result = task.result()
+                    if stream['http']:
+                        stream['service'].observe(result,now)
+                    pending.append({'target_id':stream['id'],**result})
             for stream in streams:
                 if now < stream['due']:
                     continue
@@ -82,7 +105,9 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
                 if missed:
                     pending.append({'target_id':stream['id'],'ts':time.time()-(now-stream['due']),'success':None,'error':'collector_gap','missed':missed,'detail':'scheduler delayed'})
                     stream['due'] += missed*stream['interval']
-                if stream['active']>=stream['capacity'] or len(tasks)>=256:
+                if stream['service'] and now<stream['service'].until:
+                    pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'service_backoff','missed':1,'detail':f"intentionally skipped after HTTP {stream['service'].status}; {stream['service'].until-now:g}s cooldown remaining"})
+                elif stream['active']>=stream['capacity'] or len(tasks)>=256:
                     pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'collector_gap','missed':1,'detail':'previous probe still pending or concurrency limit reached'})
                 else:
                     task = asyncio.create_task(probes.measure(stream['probe'],config['timeout']))
@@ -111,6 +136,8 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
             results = await asyncio.gather(*tasks,return_exceptions=True)
             for (task,stream),result in zip(tasks.items(),results):
                 if isinstance(result,dict):
+                    if stream['http']:
+                        stream['service'].observe(result,loop.time())
                     pending.append({'target_id':stream['id'],**result})
                 else:
                     pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'collector_gap','missed':1,'detail':'probe task interrupted'})

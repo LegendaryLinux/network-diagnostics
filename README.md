@@ -41,6 +41,10 @@ This is a fragment to insert in the existing JSON configuration, not a complete 
 
 The sampling rate applies to individual probe streams, so the combined number of requests is greater than five per second. Public services are checked at the slower interval to limit load. Public checks are small synthetic reachability requests; they do not download streams or log into accounts. Configure an explicit gateway if your default route points through a VPN or unusual routing setup. The initial implementation uses IPv4 for ICMP, explicit DNS, and UDP companion tests.
 
+Public-service HTTP responses **401, 403, or 429** trigger a shared cooldown for that configured service's DNS, TCP, and HTTP checks. The first delay starts at 60 seconds or twice `public_interval`, whichever is greater; repeated rejections double it. Both the first and subsequent automatic delays are capped at one hour, but never below your configured cadence. Valid `Retry-After` seconds or HTTP-date guidance can extend that delay. Checks resume on the next eligible scheduled tick, without catching up skipped requests. A successful HTTP check restores normal cadence and clears the rejection history; other failures do not clear that history. Gateway, remote companion, and other configured services continue normally.
+
+The actual rejected response remains a failed HTTP measurement. During cooldown, scheduled checks are recorded as **`service_backoff` coverage gaps**, with the reason and remaining delay, and do not count as network failures. Requests already in flight may finish. Cooldown state is kept only in memory and resets when collection restarts; your configured interval is unchanged.
+
 ## Run the companion as an Ubuntu service
 
 Use Ubuntu Server 22.04 or newer with systemd and Python 3.10+. Copy this repository to the server, then run from the checkout:

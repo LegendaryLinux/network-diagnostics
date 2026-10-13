@@ -9,6 +9,7 @@ import secrets
 import socket
 import struct
 import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 
@@ -132,9 +133,10 @@ async def tcp(host,port,timeout):
 
 async def http(url,timeout):
     # Fresh HEAD request measures endpoint reachability without downloading media.
-    code,output = await process('curl','--disable','--silent','--head','--output',os.devnull,'--noproxy','*','--max-time',str(timeout),'--connect-timeout',str(timeout),'--write-out','%{json}','--',url,timeout=timeout+0.2)
+    code,output = await process('curl','--disable','--silent','--head','--dump-header','-','--output',os.devnull,'--noproxy','*','--max-time',str(timeout),'--connect-timeout',str(timeout),'--write-out','\n%{json}','--',url,timeout=timeout+0.2)
+    headers,_,payload = output.rpartition('\n')
     try:
-        info = json.loads(output)
+        info = json.loads(payload)
     except (ValueError,TypeError):
         return {'success':False,'error':'http_local_error'}
     status = int(info.get('http_code',0))
@@ -151,7 +153,32 @@ async def http(url,timeout):
         result['detail'] = 'curl exit '+str(code)
     elif not result['success']:
         result['error'] = 'http_rejected' if status in (401,403,429) else 'http_status'
+    if status in (401,403,429):
+        # Only inspect the final response block; do not persist cookies or other headers.
+        for line in re.split(r'\r?\n\r?\n',headers.strip())[-1].splitlines()[1:]:
+            name,_,value = line.partition(':')
+            if name.lower()=='retry-after':
+                delay = retry_after_seconds(value.strip())
+                if delay is not None:
+                    result['retry_after_seconds'] = max(result.get('retry_after_seconds',0),delay)
     return result
+
+
+def retry_after_seconds(value):
+    # Bound hostile header parsing before integer/date conversion.
+    if not value or len(value)>128:
+        return None
+    try:
+        if re.fullmatch(r'[0-9]+',value):
+            delay = float(value)
+        else:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                return None
+            delay = max(0.,date.timestamp()-time.time())
+        return delay if math.isfinite(delay) else None
+    except (ValueError,OverflowError,TypeError):
+        return None
 
 
 class Remote:
