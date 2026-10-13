@@ -8,7 +8,7 @@ import time
 from urllib.parse import urlsplit
 
 from . import probes
-from .storage import Store
+from .storage import ClearBusy, Store
 
 
 class ServiceBackoff:
@@ -19,13 +19,15 @@ class ServiceBackoff:
         self.status = None
 
     def observe(self,result,now):
-        if result.get('http_status') in (401,403,429):
+        if not result.get('success'):
+            return
+        if result.get('http_status') in (401,403,405,429):
             self.delay = min(max(self.interval,3600),max(60,2*self.interval) if not self.delay else 2*self.delay)
             wait = max(self.delay,result.get('retry_after_seconds',0))
             self.until = now+wait
             self.status = result['http_status']
             result['detail'] = (result.get('detail','')+'; ' if result.get('detail') else '')+f'service backoff {wait:g}s after HTTP {self.status}'
-        elif result.get('success'):
+        else:
             self.delay = self.until = 0
             self.status = None
 
@@ -46,6 +48,19 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
     pending = []
     status = 'stopped'
     loop = asyncio.get_running_loop()
+    clear_request = None
+
+    async def request_clear():
+        nonlocal clear_request
+        if stop.is_set() or clear_request is not None:
+            raise ClearBusy('Collection is stopping or a clear is already pending')
+        clear_request = loop.create_future()
+        await clear_request
+
+    def clear_from_dashboard():
+        if stop.is_set() or not loop.is_running():
+            raise ClearBusy('Collection is stopping')
+        asyncio.run_coroutine_threadsafe(request_clear(),loop).result()
     for sig in (signal.SIGINT,signal.SIGTERM):
         loop.add_signal_handler(sig,stop.set)
 
@@ -53,14 +68,9 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
         streams.append({'id':store.target(name,kind,endpoint,interval),'probe':function,'interval':interval,'due':loop.time(),'active':0,'service':service,'http':kind in ('http','https'),'capacity':1 if kind in ('persistent_tcp','http','https') else min(64,math.ceil(config['timeout']/interval)+2)})
 
     try:
-        if config['gateway']:
-            add('Gateway','icmp',config['gateway'],config['fast_interval'],functools.partial(probes.ping,config['gateway'],config['timeout']))
-        else:
-            print('No default IPv4 gateway detected: configure gateway to measure the local link.',file=sys.stderr)
         if config['remote']:
             remote = probes.Remote(config['remote']['host'],config['remote']['port'],key,config['timeout'])
             endpoint = remote.host+':'+str(remote.port)
-            add('Remote','icmp',remote.host,config['fast_interval'],functools.partial(probes.ping,remote.host,config['timeout']))
             add('Remote','persistent_tcp',endpoint,config['fast_interval'],remote.persistent)
             add('Remote','udp',endpoint,config['fast_interval'],remote.udp)
         else:
@@ -76,13 +86,46 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
         if serve_dashboard:
             import threading
             from .dashboard import create_server
-            server = create_server(config['db'],port=config['dashboard_port'])
+            server = create_server(config['db'],port=config['dashboard_port'],clear_callback=clear_from_dashboard)
             threading.Thread(target=server.serve_forever,daemon=True).start()
             print('Dashboard: http://127.0.0.1:'+str(config['dashboard_port']),flush=True)
         print('Collecting into '+config['db']+'; Ctrl+C stops and flushes results.',flush=True)
         last_flush = loop.time()
         previous_clock,previous_wall = loop.time(),time.time()
         while not stop.is_set():
+            if clear_request is not None:
+                clear_started = loop.time()
+                # Pause scheduling and drain bounded probes before changing the dataset.
+                if tasks:
+                    results = await asyncio.gather(*tasks,return_exceptions=True)
+                    for stream,result in zip(tasks.values(),results):
+                        stream['active'] -= 1
+                        if isinstance(result,dict):
+                            if stream['http']:
+                                stream['service'].observe(result,loop.time())
+                            pending.append({'target_id':stream['id'],**result})
+                        else:
+                            pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'collector_gap','missed':1,'detail':'probe interrupted before history clear'})
+                    tasks.clear()
+                try:
+                    if stop.is_set():
+                        raise ClearBusy('Collection is stopping')
+                    store.clear(config,[stream['id'] for stream in streams])
+                except Exception as error:
+                    for stream in streams:
+                        missed = int((loop.time()-clear_started)/stream['interval'])
+                        if missed:
+                            pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'collector_gap','missed':missed,'detail':'collection paused for failed history clear'})
+                    clear_request.set_exception(error)
+                else:
+                    pending.clear()
+                    clear_request.set_result(None)
+                finally:
+                    clear_request = None
+                    last_flush = loop.time()
+                    previous_clock,previous_wall = loop.time(),time.time()
+                    for stream in streams:
+                        stream['due'] = loop.time()+stream['interval']
             now = loop.time()
             wall = time.time()
             clock_difference = wall-previous_wall-(now-previous_clock)
@@ -105,7 +148,7 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
                 if missed:
                     pending.append({'target_id':stream['id'],'ts':time.time()-(now-stream['due']),'success':None,'error':'collector_gap','missed':missed,'detail':'scheduler delayed'})
                     stream['due'] += missed*stream['interval']
-                if stream['service'] and now<stream['service'].until:
+                if stream['http'] and now<stream['service'].until:
                     pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'service_backoff','missed':1,'detail':f"intentionally skipped after HTTP {stream['service'].status}; {stream['service'].until-now:g}s cooldown remaining"})
                 elif stream['active']>=stream['capacity'] or len(tasks)>=256:
                     pending.append({'target_id':stream['id'],'ts':time.time(),'success':None,'error':'collector_gap','missed':1,'detail':'previous probe still pending or concurrency limit reached'})
@@ -131,6 +174,10 @@ async def collect(config, *, serve_dashboard=True, stop=None, key=None):
         status = 'failed'
         raise
     finally:
+        stop.set()
+        if clear_request is not None and not clear_request.done():
+            clear_request.set_exception(ClearBusy('Collection is stopping'))
+            clear_request = None
         # Finish bounded pending probes on normal stop; preserve outcomes before closing.
         if tasks:
             results = await asyncio.gather(*tasks,return_exceptions=True)

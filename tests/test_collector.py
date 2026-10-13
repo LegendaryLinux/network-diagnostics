@@ -26,16 +26,23 @@ class ConfigTests(unittest.TestCase):
                     load_config(path)
 
 
-class ProbeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_ping_success_no_reply_local_error(self):
-        with patch('netdiag.probes.process',AsyncMock(return_value=(0,'64 bytes: time=12.4 ms'))):
-            self.assertEqual((await probes.ping('127.0.0.1',1))['latency_ms'],12.4)
-        with patch('netdiag.probes.process',AsyncMock(return_value=(1,''))):
-            self.assertEqual((await probes.ping('127.0.0.1',1))['error'],'icmp_no_reply')
-        with patch('netdiag.probes.process',AsyncMock(return_value=(2,''))):
-            result = await probes.measure(lambda:probes.ping('127.0.0.1',1),1)
-            self.assertIsNone(result['success'])
+    def test_legacy_gateway_is_ignored_without_route_discovery(self):
+        def read_fixture(path,*args,**kwargs):
+            if str(path)=='legacy.json':
+                return json.dumps({'gateway':{'unused':'not an IP address'},'public_interval':60})
+            if str(path)=='/etc/resolv.conf':
+                return 'nameserver 127.0.0.1'
+            self.fail('Unexpected configuration read: '+str(path))
+        with patch('netdiag.config.Path.read_text',autospec=True,side_effect=read_fixture):
+            config = load_config('legacy.json')
+            defaults = load_config()
+        self.assertNotIn('gateway',config)
+        self.assertNotIn('gateway',defaults)
+        self.assertEqual(config['public_interval'],60)
+        self.assertEqual(config['dns_server'],'127.0.0.1')
 
+
+class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_transport_errors_and_local_gaps(self):
         for error,category in ((asyncio.TimeoutError(),'timeout'),(ConnectionRefusedError(),'connection_refused'),(FileNotFoundError(),'missing_executable'),(PermissionError(),'local_permission'),(ValueError(),'invalid_response')):
             result = await probes.measure(AsyncMock(side_effect=error),1)
@@ -46,13 +53,38 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_timing_and_rejection(self):
         with patch('netdiag.probes.process',AsyncMock(return_value=(0,json.dumps({'http_code':403,'time_total':.1,'time_namelookup':.01,'time_connect':.03,'time_appconnect':.07})))):
             result = await probes.http('https://example.com',1)
-        self.assertFalse(result['success'])
+        self.assertTrue(result['success'])
         self.assertEqual(result['http_status'],403)
-        self.assertEqual(result['error'],'http_rejected')
+        self.assertNotIn('error',result)
+        self.assertIn('request rejected',result['detail'])
         self.assertAlmostEqual(result['connect_ms'],20)
         self.assertAlmostEqual(result['tls_ms'],40)
         with patch('netdiag.probes.process',AsyncMock(return_value=(28,'{"http_code":0,"time_total":1.0}'))):
             self.assertEqual((await probes.http('https://example.com',1))['error'],'timeout')
+
+    async def test_http_completed_statuses_and_partial_transport_failures(self):
+        for status in (200,204,301,399,400,401,403,404,405,429,500,503,599):
+            with self.subTest(status=status),patch('netdiag.probes.process',AsyncMock(return_value=(0,json.dumps({'http_code':status,'time_total':.05})))):
+                result = await probes.http('https://fixture.test/',1)
+                self.assertTrue(result['success'])
+                self.assertEqual(result['http_status'],status)
+                self.assertEqual(result['latency_ms'],50)
+                self.assertNotIn('error',result)
+        for status in (100,101,199,0,600,None,True,200.5,'200','garbage'):
+            with self.subTest(status=status),patch('netdiag.probes.process',AsyncMock(return_value=(0,json.dumps({'http_code':status})))):
+                result = await probes.http('https://fixture.test/',1)
+                self.assertFalse(result['success'])
+                self.assertEqual(result['error'],'http_invalid_response')
+        for code,error in ((28,'timeout'),(35,'tls_failure'),(60,'tls_certificate'),(56,'receive_failure')):
+            with self.subTest(code=code),patch('netdiag.probes.process',AsyncMock(return_value=(code,json.dumps({'http_code':403,'time_total':1})))):
+                result = await probes.http('https://fixture.test/',1)
+                self.assertFalse(result['success'])
+                self.assertEqual(result['http_status'],403)
+                self.assertEqual(result['error'],error)
+                self.assertEqual(result['detail'],'curl exit '+str(code))
+        for payload in ('not-json','null','[]'):
+            with self.subTest(payload=payload),patch('netdiag.probes.process',AsyncMock(return_value=(28,payload))):
+                self.assertEqual((await probes.http('https://fixture.test/',1))['error'],'timeout')
 
     async def test_persistent_frames_reconnect_and_timeout(self):
         key = b'x'*32
@@ -98,7 +130,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = str(Path(temp)/'data.sqlite3')
             config = load_config()
-            config.update(db=path,gateway='127.0.0.1',services=[],remote={'host':'localhost','port':48123},fast_interval=.05,timeout=.1)
+            config.update(db=path,services=[],remote={'host':'localhost','port':48123},fast_interval=.05,timeout=.1)
             stop = asyncio.Event()
             async def slow():
                 await asyncio.sleep(.14)
@@ -109,7 +141,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             remote.udp = AsyncMock(return_value={'success':False,'error':'timeout'})
             remote.close = AsyncMock()
             asyncio.get_running_loop().call_later(.36,stop.set)
-            with patch('netdiag.protocol.load_key',return_value=b'x'*32),patch('netdiag.probes.Remote',return_value=remote),patch('netdiag.probes.ping',AsyncMock(return_value={'success':True,'latency_ms':1})):
+            with patch('netdiag.protocol.load_key',return_value=b'x'*32),patch('netdiag.probes.Remote',return_value=remote):
                 await collect(config,serve_dashboard=False,stop=stop)
             metadata = Reader(path).metadata()
             self.assertEqual(metadata['sessions'][0]['status'],'stopped')
@@ -125,13 +157,14 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = str(Path(temp)/'data.sqlite3')
             config = load_config()
-            config.update(db=path,gateway='127.0.0.1',services=[],remote=None,fast_interval=.05,timeout=.1)
+            config.update(db=path,services=[{'name':'Fixture','url':'https://fixture.test/'}],remote=None,public_interval=.05,timeout=.1)
             stop = asyncio.Event()
             asyncio.get_running_loop().call_later(.12,stop.set)
             stderr = io.StringIO()
-            with patch('netdiag.storage.Store.append',side_effect=OSError(errno.ENOSPC,'fixture full disk')),patch('netdiag.probes.ping',AsyncMock(return_value={'success':True,'latency_ms':1})),patch('sys.stderr',stderr):
+            with patch('netdiag.storage.Store.append',side_effect=OSError(errno.ENOSPC,'fixture full disk')) as append,patch('netdiag.probes.dns',AsyncMock(return_value={'success':True,'latency_ms':1})),patch('netdiag.probes.tcp',AsyncMock(return_value={'success':True,'latency_ms':1})),patch('netdiag.probes.http',AsyncMock(return_value={'success':True,'latency_ms':1})),patch('sys.stderr',stderr):
                 with self.assertRaises(OSError):
                     await collect(config,serve_dashboard=False,stop=stop)
+            self.assertTrue(any(row['success'] for row in append.call_args.args[0]))
             self.assertEqual(Reader(path).metadata()['sessions'][0]['status'],'failed')
             self.assertIn('FATAL: storage write failed',stderr.getvalue())
             self.assertIn('could not be saved',stderr.getvalue())

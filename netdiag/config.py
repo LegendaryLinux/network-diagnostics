@@ -2,8 +2,6 @@
 import ipaddress
 import json
 import math
-import socket
-import struct
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -11,20 +9,9 @@ DEFAULT_SERVICES = [
     {'name':'YouTube','url':'https://www.youtube.com/'},
     {'name':'Discord','url':'https://discord.com/'},
     {'name':'Steam','url':'https://store.steampowered.com/'},
-    {'name':'Crunchyroll','url':'https://www.crunchyroll.com/'},
-    {'name':'Netflix','url':'https://www.netflix.com/'},
+    {'name':'Google','url':'https://www.google.com/'},
+    {'name':'Yahoo','url':'https://www.yahoo.com/'},
 ]
-
-
-def gateway_address():
-    try:
-        for line in Path('/proc/net/route').read_text().splitlines()[1:]:
-            fields = line.split()
-            if fields[1] == '00000000' and int(fields[3],16) & 2:
-                return socket.inet_ntoa(struct.pack('<I', int(fields[2],16)))
-    except (OSError,ValueError,IndexError):
-        pass
-    return None
 
 
 def resolver_address():
@@ -40,11 +27,12 @@ def resolver_address():
 
 
 def load_config(path=None):
-    config = {'db':'data/netdiag.sqlite3','gateway':None,'remote':None,'fast_interval':0.2,'public_interval':5.0,'timeout':2.0,'dashboard_port':8765,'dns_server':None,'services':DEFAULT_SERVICES}
+    config = {'db':'data/netdiag.sqlite3','remote':None,'fast_interval':0.2,'public_interval':5.0,'timeout':2.0,'dashboard_port':8765,'dns_server':None,'services':DEFAULT_SERVICES}
     if path:
         supplied = json.loads(Path(path).read_text())
-        if not isinstance(supplied,dict) or set(supplied)-set(config):
+        if not isinstance(supplied,dict) or set(supplied)-set(config)-{'gateway'}:
             raise ValueError('Unknown configuration fields; use config.example.json')
+        supplied.pop('gateway',None)  # Older configurations may still specify this unused field.
         config.update(supplied)
     for field in ('fast_interval','public_interval','timeout'):
         if isinstance(config[field],bool) or not isinstance(config[field],(int,float)) or not math.isfinite(config[field]) or not 0.05 <= config[field] <= 3600:
@@ -55,12 +43,9 @@ def load_config(path=None):
         raise ValueError('dashboard_port must be 1–65535')
     if not isinstance(config['db'],str) or not config['db']:
         raise ValueError('db must be a nonempty path')
-    config['gateway'] = config['gateway'] or gateway_address()
     config['dns_server'] = config['dns_server'] or resolver_address()
-    for field in ('gateway','dns_server'):
-        if config[field] is not None:
-            if ipaddress.ip_address(config[field]).version != 4:
-                raise ValueError(field + ' must be an IPv4 address')
+    if config['dns_server'] is not None and ipaddress.ip_address(config['dns_server']).version != 4:
+        raise ValueError('dns_server must be an IPv4 address')
     if config['remote']:
         remote = config['remote']
         if not isinstance(remote,dict) or set(remote)-{'host','port'} or not isinstance(remote.get('host'),str) or not remote['host'] or remote['host'].startswith('-') or len(remote['host'])>253:

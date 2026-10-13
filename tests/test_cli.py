@@ -23,11 +23,11 @@ class ClientKeyTests(unittest.TestCase):
         self.key = 'tiny'
         self.derived_key = derive_key(self.key)
 
-    def invoke(self, *, environment=None, prompt=None, config=None, argv=None):
+    def invoke(self, *, environment=None, prompt=None, config=None, argv=None, cache=None):
         output = io.StringIO()
-        with patch.dict(os.environ,environment or {},clear=True),patch('sys.argv',argv or ['netdiag','collect']),patch('netdiag.config.load_config',return_value=config or self.config),patch('netdiag.collector.collect',new_callable=AsyncMock) as run,patch('getpass.getpass',**(prompt or {'return_value':self.key})) as ask,contextlib.redirect_stdout(output),contextlib.redirect_stderr(output):
+        with tempfile.TemporaryDirectory() as directory,patch.dict(os.environ,{**(environment or {}),'XDG_CONFIG_HOME':cache or directory},clear=True),patch('sys.argv',argv or ['netdiag','collect']),patch('netdiag.config.load_config',return_value=config or self.config),patch('netdiag.collector.collect',new_callable=AsyncMock) as run,patch('getpass.getpass',**(prompt or {'return_value':self.key})) as ask,contextlib.redirect_stdout(output),contextlib.redirect_stderr(output):
             result = main()
-            environment_after = dict(os.environ)
+            environment_after = {name:value for name,value in os.environ.items() if name!='XDG_CONFIG_HOME'}
         self.assertNotIn(self.key,output.getvalue())
         return result,run,ask,output.getvalue(),environment_after
 
@@ -47,6 +47,36 @@ class ClientKeyTests(unittest.TestCase):
         ask.assert_not_called()
         self.assertEqual(run.call_args.kwargs['key'],self.derived_key)
         self.assertEqual(after['NETDIAG_KEY'],self.key)
+
+    def test_remembered_key_environment_override_and_explicit_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.invoke(cache=directory)[0],0)
+            saved = next((Path(directory)/'network-diagnostics').glob('*.key')).read_bytes()
+            result,run,ask,_,_ = self.invoke(cache=directory)
+            self.assertEqual(result,0)
+            ask.assert_not_called()
+            self.assertEqual(run.call_args.kwargs['key'],self.derived_key)
+            result,run,ask,_,_ = self.invoke(cache=directory,environment={'NETDIAG_KEY':'override'})
+            self.assertEqual(result,0)
+            ask.assert_not_called()
+            self.assertEqual(run.call_args.kwargs['key'],derive_key('override'))
+            self.assertEqual(next((Path(directory)/'network-diagnostics').glob('*.key')).read_bytes(),saved)
+            result,run,ask,_,_ = self.invoke(cache=directory,environment={'NETDIAG_KEY':'override'},
+                                            argv=['netdiag','collect','--ask-passphrase'],prompt={'return_value':'replacement'})
+            self.assertEqual(result,0)
+            ask.assert_called_once()
+            self.assertEqual(run.call_args.kwargs['key'],derive_key('replacement'))
+            result,run,ask,_,_ = self.invoke(cache=directory)
+            self.assertEqual(result,0)
+            ask.assert_not_called()
+            self.assertEqual(run.call_args.kwargs['key'],derive_key('replacement'))
+
+    def test_cache_save_failure_stops_collection(self):
+        with patch('netdiag.credentials.save_key',side_effect=ValueError('Cannot safely save authentication key')):
+            result,run,_,output,_ = self.invoke()
+        self.assertEqual(result,1)
+        run.assert_not_called()
+        self.assertIn('Cannot safely save',output)
 
     def test_empty_passphrase_fails_and_short_unicode_input_is_accepted(self):
         result,run,_,output,_ = self.invoke(prompt={'return_value':''})
@@ -85,7 +115,10 @@ class ClientKeyTests(unittest.TestCase):
         self.assertIn('NETDIAG_KEY',output)
 
     def test_local_collection_and_dashboard_do_not_prompt(self):
-        result,run,ask,_,_ = self.invoke(config={'remote':None})
+        with patch('netdiag.credentials.load_saved_key') as cached,patch('netdiag.credentials.save_key') as save:
+            result,run,ask,_,_ = self.invoke(config={'remote':None})
+        cached.assert_not_called()
+        save.assert_not_called()
         self.assertEqual(result,0)
         ask.assert_not_called()
         self.assertIsNone(run.call_args.kwargs['key'])
@@ -100,7 +133,7 @@ class ClientKeyTests(unittest.TestCase):
     def test_prompt_key_does_not_enter_dataset_and_invalid_key_creates_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             config = load_config()
-            config.update(db=str(Path(directory)/'dataset'/'test.sqlite3'),gateway=None,services=[],remote={'host':'example.test','port':48123})
+            config.update(db=str(Path(directory)/'dataset'/'test.sqlite3'),services=[],remote={'host':'example.test','port':48123})
             with self.assertRaises(ValueError):
                 asyncio.run(collect(config,serve_dashboard=False,key=b'short'))
             self.assertFalse(Path(config['db']).exists())

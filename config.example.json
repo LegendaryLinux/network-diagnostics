@@ -1,6 +1,5 @@
 {
   "db": "data/netdiag.sqlite3",
-  "gateway": null,
   "remote": null,
   "fast_interval": 0.2,
   "public_interval": 5,
@@ -11,7 +10,7 @@
     {"name": "YouTube", "url": "https://www.youtube.com/"},
     {"name": "Discord", "url": "https://discord.com/"},
     {"name": "Steam", "url": "https://store.steampowered.com/"},
-    {"name": "Crunchyroll", "url": "https://www.crunchyroll.com/"},
-    {"name": "Netflix", "url": "https://www.netflix.com/"}
+    {"name": "Google", "url": "https://www.google.com/"},
+    {"name": "Yahoo", "url": "https://www.yahoo.com/"}
   ]
 }

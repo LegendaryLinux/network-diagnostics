@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from netdiag.dashboard import create_server
-from netdiag.storage import Store
+from netdiag.storage import OutcomeHistoryUnavailable, Store
 
 
 class DashboardTests(unittest.TestCase):
@@ -49,7 +49,7 @@ class DashboardTests(unittest.TestCase):
         return int(headers.split()[1]), headers, body
 
     def test_read_endpoints_and_assets(self):
-        for path in ('/', '/app.js', '/style.css', '/api/metadata', '/api/series?start=100&end=200', '/api/samples?start=100&end=200&limit=1', '/api/outages?start=100&end=200'):
+        for path in ('/', '/app.js', '/style.css', '/api/metadata', '/api/series?start=100&end=200', '/api/samples?start=100&end=200&limit=1', '/api/outages?start=100&end=200', '/api/outcomes?start=100&end=200'):
             with self.subTest(path=path):
                 status, headers, body = self.request(path)
                 self.assertEqual(status,200)
@@ -69,6 +69,19 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(self.request('/api/samples?'+query)[0],400)
         self.assertEqual(self.request('/api/series?start=100&end=200&buckets=601')[0],400)
         self.assertEqual(self.request('/api/metadata?start=1')[0],400)
+
+    def test_outcomes_exact_counts_bounds_and_actionable_limit(self):
+        status,_,body = self.request('/api/outcomes?start=120&end=240')
+        self.assertEqual(status,200)
+        point = json.loads(body)['buckets'][0]
+        self.assertEqual((point['excellent'],point['failed'],point['total']),(1,1,2))
+        for query in ('start=0&end=14600','start=120&end=240&limit=120','start=120&end=240&before_ts=120','start=120&end=240&targets=0'):
+            self.assertEqual(self.request('/api/outcomes?'+query)[0],400)
+        with patch('netdiag.dashboard.Reader.outcomes',side_effect=OutcomeHistoryUnavailable('private path')):
+            status,_,body = self.request('/api/outcomes?start=120&end=240')
+        self.assertEqual(status,503)
+        self.assertIn('start collection once',json.loads(body)['error'])
+        self.assertNotIn('private path',body.decode())
 
     def test_local_access_boundaries(self):
         self.assertEqual(self.request('/api/metadata',host='attacker.example:8765')[0],403)

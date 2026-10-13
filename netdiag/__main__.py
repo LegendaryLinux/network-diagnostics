@@ -11,8 +11,9 @@ def main():
     parser = argparse.ArgumentParser(description='Continuous network diagnostics with indefinite granular history')
     commands = parser.add_subparsers(dest='command',required=True)
     collect = commands.add_parser('collect',help='Collect until Ctrl+C; serve local dashboard')
-    collect.add_argument('--config',help='JSON configuration (defaults work for gateway and public checks)')
+    collect.add_argument('--config',help='JSON configuration (defaults work for public-service checks)')
     collect.add_argument('--no-dashboard',action='store_true',help='Only collect; dashboard can run separately')
+    collect.add_argument('--ask-passphrase',action='store_true',help='Prompt and replace the remembered remote key, overriding NETDIAG_KEY')
     dashboard = commands.add_parser('dashboard',help='Inspect an existing dataset without collecting')
     dashboard.add_argument('--db',default='data/netdiag.sqlite3')
     dashboard.add_argument('--port',type=int,default=8765)
@@ -25,9 +26,12 @@ def main():
             key = None
             if config['remote']:
                 from .protocol import derive_key,load_key
-                if os.environ.get('NETDIAG_KEY'):
+                from .credentials import load_saved_key,save_key
+                if not args.ask_passphrase and os.environ.get('NETDIAG_KEY'):
                     key = load_key()
-                else:
+                elif not args.ask_passphrase:
+                    key = load_saved_key(config['remote'])
+                if key is None:
                     try:
                         with warnings.catch_warnings():
                             warnings.simplefilter('error',getpass.GetPassWarning)
@@ -36,6 +40,7 @@ def main():
                         raise ValueError('Cannot read a hidden passphrase without a usable terminal; supply NETDIAG_KEY for unattended collection') from None
                     except (EOFError,KeyboardInterrupt):
                         raise ValueError('Passphrase entry cancelled; collection was not started') from None
+                    save_key(config['remote'],key)
             asyncio.run(run(config,serve_dashboard=not args.no_dashboard,key=key))
         else:
             from .dashboard import create_server

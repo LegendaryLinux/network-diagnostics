@@ -24,14 +24,6 @@ async def process(*args, timeout):
             await child.communicate()
 
 
-async def ping(host, timeout):
-    code, output = await process('ping','-n','-c','1','-W',str(timeout),'--',host, timeout=timeout+0.2)
-    match = re.search(r'time[=<]([\d.]+)\s*ms',output)
-    if code == 0 and match:
-        return {'success':True,'latency_ms':float(match[1])}
-    return {'success':False,'error':'icmp_no_reply' if code==1 else 'icmp_local_error'}
-
-
 async def dns(host, server, timeout):
     if not server:
         return {'success':False,'error':'dns_configuration'}
@@ -138,22 +130,27 @@ async def http(url,timeout):
     try:
         info = json.loads(payload)
     except (ValueError,TypeError):
-        return {'success':False,'error':'http_local_error'}
-    status = int(info.get('http_code',0))
-    result = {'success':code==0 and 200<=status<400,'http_status':status or None}
+        info = None
+    valid_metadata = isinstance(info,dict)
+    info = info if valid_metadata else {}
+    status = info.get('http_code')
+    if type(status) is not int or not 100<=status<=599:
+        status = None
+    result = {'success':code==0 and status is not None and status>=200,'http_status':status}
     for key,value in (('latency_ms',info.get('time_total')),('dns_ms',info.get('time_namelookup'))):
-        if isinstance(value,(float,int)) and math.isfinite(value):
+        if type(value) in (float,int) and math.isfinite(value) and value>=0:
             result[key] = value*1000
-    if info.get('time_connect',0)>0:
-        result['connect_ms'] = max(0,info['time_connect']-info.get('time_namelookup',0))*1000
-    if info.get('time_appconnect',0)>0:
-        result['tls_ms'] = max(0,info['time_appconnect']-info.get('time_connect',0))*1000
+    for key,end,start in (('connect_ms','time_connect','time_namelookup'),('tls_ms','time_appconnect','time_connect')):
+        end,start = info.get(end,0),info.get(start,0)
+        if all(type(value) in (float,int) and math.isfinite(value) and value>=0 for value in (end,start)) and end>0:
+            result[key] = max(0,end-start)*1000
     if code:
         result['error'] = {5:'dns_failure',6:'dns_failure',7:'connection_failure',28:'timeout',35:'tls_failure',60:'tls_certificate',52:'empty_response',56:'receive_failure'}.get(code,'http_transport_error')
         result['detail'] = 'curl exit '+str(code)
     elif not result['success']:
-        result['error'] = 'http_rejected' if status in (401,403,429) else 'http_status'
-    if status in (401,403,429):
+        result['error'] = 'http_invalid_response' if valid_metadata else 'http_local_error'
+    if result['success'] and status in (401,403,405,429):
+        result['detail'] = f'HTTP {status}: endpoint reached; request rejected'
         # Only inspect the final response block; do not persist cookies or other headers.
         for line in re.split(r'\r?\n\r?\n',headers.strip())[-1].splitlines()[1:]:
             name,_,value = line.partition(':')
@@ -257,7 +254,7 @@ async def measure(probe,timeout):
         result = {'success':False,'error':'invalid_response'}
     except OSError as error:
         result = {'success':False,'error':'local_resource_error' if error.errno in (errno.EMFILE,errno.ENFILE,errno.ENOMEM,errno.ENOBUFS,errno.ENOSPC,errno.EAGAIN,errno.EADDRINUSE,errno.EADDRNOTAVAIL,errno.EBADF,errno.EINVAL,errno.EAFNOSUPPORT,errno.EPROTONOSUPPORT) else 'network_error','detail':'errno='+str(error.errno)}
-    if result.get('error') in ('local_resource_error','local_permission','missing_executable','icmp_local_error','dns_configuration','http_local_error'):
+    if result.get('error') in ('local_resource_error','local_permission','missing_executable','dns_configuration','http_local_error'):
         result['success'] = None
         result['missed'] = 1
     result['ts'] = started
