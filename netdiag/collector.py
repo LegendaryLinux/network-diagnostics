@@ -11,7 +11,13 @@ from . import probes
 from .storage import Store
 
 
-async def collect(config, *, serve_dashboard=True, stop=None):
+async def collect(config, *, serve_dashboard=True, stop=None, key=None):
+    if config['remote']:
+        if key is None:
+            from .protocol import load_key
+            key = load_key()
+        if not isinstance(key,bytes) or len(key)<32:
+            raise ValueError('The shared key must contain at least 32 UTF-8 bytes')
     store = Store(config['db'],config)
     stop = stop or asyncio.Event()
     server = None
@@ -33,8 +39,7 @@ async def collect(config, *, serve_dashboard=True, stop=None):
         else:
             print('No default IPv4 gateway detected: configure gateway to measure the local link.',file=sys.stderr)
         if config['remote']:
-            from .protocol import load_key
-            remote = probes.Remote(config['remote']['host'],config['remote']['port'],load_key(),config['timeout'])
+            remote = probes.Remote(config['remote']['host'],config['remote']['port'],key,config['timeout'])
             endpoint = remote.host+':'+str(remote.port)
             add('Remote','icmp',remote.host,config['fast_interval'],functools.partial(probes.ping,remote.host,config['timeout']))
             add('Remote','persistent_tcp',endpoint,config['fast_interval'],remote.persistent)

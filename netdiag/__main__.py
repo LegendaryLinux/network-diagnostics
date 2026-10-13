@@ -1,7 +1,10 @@
 """Run with python -m netdiag."""
 import argparse
 import asyncio
+import getpass
+import os
 import sys
+import warnings
 
 
 def main():
@@ -18,7 +21,26 @@ def main():
         if args.command=='collect':
             from .config import load_config
             from .collector import collect as run
-            asyncio.run(run(load_config(args.config),serve_dashboard=not args.no_dashboard))
+            config = load_config(args.config)
+            key = None
+            if config['remote']:
+                if os.environ.get('NETDIAG_KEY'):
+                    from .protocol import load_key
+                    key = load_key()
+                else:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('error',getpass.GetPassWarning)
+                            key = getpass.getpass('Diagnostic shared key: ').encode('utf-8')
+                    except getpass.GetPassWarning:
+                        raise ValueError('Cannot read a hidden key without a usable terminal; supply NETDIAG_KEY for unattended collection') from None
+                    except (EOFError,KeyboardInterrupt):
+                        raise ValueError('Shared-key entry cancelled; collection was not started') from None
+                    except UnicodeError:
+                        raise ValueError('The shared key must be valid UTF-8 text') from None
+                    if len(key)<32:
+                        raise ValueError('The shared key must contain at least 32 UTF-8 bytes')
+            asyncio.run(run(config,serve_dashboard=not args.no_dashboard,key=key))
         else:
             from .dashboard import create_server
             from .storage import Reader

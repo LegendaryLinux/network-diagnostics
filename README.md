@@ -53,14 +53,13 @@ On first installation, enter a random shared key of at least 32 bytes at the hid
 
 The companion starts at boot, restarts after failures, and runs as an unprivileged user. Once the installer reports success, you can disconnect SSH. If you previously started the companion manually, stop that process with **Ctrl+C** before installing so it releases the port. No third-party Python packages are needed; if Python is missing, install it with `sudo apt install python3` first.
 
-On the **Arch client**, enter the matching key through a hidden Bash prompt before starting the collector:
+On the **Arch client**, set `remote` in the configuration as described above and start the collector:
 
 ```bash
-read -rsp 'Diagnostic shared key: ' NETDIAG_KEY
-export NETDIAG_KEY
+python -m netdiag collect --config config.json
 ```
 
-The prompt does not echo the secret. Set `remote` in the configuration as described above and run `python -m netdiag collect --config config.json` from the repository. After stopping the collector, `unset NETDIAG_KEY` clears that shell's copy. Ensure the clocks on both computers are synchronized; authenticated requests outside a 30-second clock window are rejected.
+Enter the matching shared key at the hidden prompt. It must contain at least 32 UTF-8 bytes. The client keeps the entered key in memory for that run; it does not save it to your configuration or dataset. Local-only collection and dashboard inspection do not prompt. For unattended collection, supply `NETDIAG_KEY` through your environment instead; a nonempty environment key takes precedence. Without a usable terminal or an environment key, remote collection exits before creating a dataset. Ensure the clocks on both computers are synchronized; authenticated requests outside a 30-second clock window are rejected.
 
 Allow inbound **TCP and UDP port 48123** in your server/provider firewall, preferably restricted to your client address. ICMP ping must be allowed separately; it has no port. The installer does not change firewall rules. Public-service HTTPS tests use their normal ports; the companion protocol is not HTTP or TLS.
 
